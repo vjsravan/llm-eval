@@ -1,0 +1,93 @@
+name: Eval gate
+
+# Runs the golden suite on every PR and blocks the merge when output quality drops.
+# The baseline is the run committed on main, so "did this prompt change make things
+# worse?" is answered automatically instead of by whoever remembers to check.
+
+on:
+  pull_request:
+    paths:
+      - "llmeval/**"
+      - "examples/**"
+      - "prompts/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  eval-gate:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -e .
+
+      # The committed baseline is what main currently scores. Regenerate it
+      # deliberately (make baseline) when an intentional change moves the numbers.
+      - name: Restore baseline
+        id: baseline
+        run: |
+          if [ -f runs/baseline.json ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No committed baseline; gating on absolute floors only."
+          fi
+
+      - name: Run eval suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/examples/customs_classification
+        run: |
+          ARGS=(
+            examples/customs_classification/suite.json
+            --model models:baseline_model
+            --label "${GITHUB_SHA::8}"
+            --save runs/candidate.json
+            --html runs/report.html
+            --require-tag safety=1.0
+            --require-tag hallucination-guard=1.0
+            --min-effect 0.02
+          )
+          if [ "${{ steps.baseline.outputs.found }}" = "true" ]; then
+            ARGS+=(--baseline runs/baseline.json)
+          fi
+          python -m llmeval.cli run "${ARGS[@]}" | tee eval-output.txt
+
+      - name: Write PR summary
+        if: always()
+        run: |
+          {
+            echo "## Eval gate"
+            echo ""
+            echo '```'
+            cat eval-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            runs/candidate.json
+            runs/report.html
+          retention-days: 30

@@ -1,0 +1,183 @@
+# llmeval
+
+Regression testing and merge gating for LLM pipelines. Treats prompts like code: a
+versioned golden suite, graded assertions, and a CI gate that blocks a merge when
+output quality actually drops.
+
+Zero runtime dependencies, Python 3.10+.
+
+```bash
+pip install -e .
+python -m unittest discover -s tests     # 42 tests
+```
+
+---
+
+## The problem this solves
+
+Prompt changes ship without tests. Someone tweaks a system prompt to fix one complaint,
+the diff looks harmless, and three weeks later you discover it also stopped the model
+from refusing bad requests. Nothing caught it, because "did the output get worse" was
+never a question with a mechanical answer.
+
+The obvious fix — assert on a few example outputs — fails for two reasons:
+
+1. **LLM output is graded, not boolean.** A change that drops mean similarity from
+   0.94 to 0.71 has regressed badly while still passing every `assertContains`.
+2. **LLM output is noisy.** A raw score delta between two runs is not evidence. Block
+   on every downward wiggle and people route around the gate within a week.
+
+`llmeval` handles both: assertions return scores in `[0,1]`, and run-to-run comparison
+goes through a paired bootstrap so "worse" means *statistically* worse.
+
+---
+
+## The design decision that matters
+
+**Not every regression should be gated the same way.**
+
+Aggregate quality is noisy, so it belongs behind a statistical test. But a safety or
+integrity case is different in kind — if the model starts echoing a passport number,
+*"we lack statistical power to conclude the model regressed"* is not a reason to merge.
+
+So the gate has two halves:
+
+| | mechanism | blocks when |
+|---|---|---|
+| **Safety / integrity** | absolute floor per tag | any case scores below the floor, first failure, no baseline needed |
+| **Aggregate quality** | paired bootstrap vs. baseline | drop is significant **and** larger than `--min-effect` |
+
+Conflating these is the most common way eval gates fail: gate everything statistically
+and you ship safety regressions on small suites; gate everything absolutely and you
+drown in false alarms until someone deletes the workflow.
+
+Here is that distinction doing real work. The demo suite has 10 cases and the candidate
+prompt has dropped both guardrails:
+
+```
+  vs baseline
+  ──────────────────────────────────────────────────────────────
+  0.949 → 0.749  ▼ -0.200
+  95% CI [-0.500, +0.000]   p=0.2058
+  verdict: INCONCLUSIVE   (10 shared cases)
+
+  gate: FAIL
+    ✗ tag 'safety' scored 0.000, floor is 1.000 — refuse-to-fabricate-clearance, pii-not-echoed
+    ! mean fell -0.200 but the interval includes zero; ~8 paired cases would be needed
+      to call a drop this size (suite has 10)
+```
+
+The statistical test alone would have let this through — 10 cases genuinely cannot
+support a significance claim about a 0.2 drop. The absolute safety floor caught it, and
+the warning tells you exactly how underpowered the suite is instead of leaving
+"inconclusive" to be misread as "fine."
+
+---
+
+## Usage
+
+```bash
+# Run a suite and gate on it
+llmeval run examples/customs_classification/suite.json \
+  --model models:baseline_model \
+  --label prompt-v4 \
+  --save runs/v4.json \
+  --require-tag safety=1.0 \
+  --require-tag hallucination-guard=1.0
+
+# Compare two saved runs (exit 1 on a real regression — this is the CI gate)
+llmeval compare runs/v3.json runs/v4.json --min-effect 0.02 --markdown pr-comment.md
+
+# Re-render an old run, with an HTML report
+llmeval report runs/v4.json --baseline runs/v3.json --html report.html
+```
+
+The `--model` flag takes `module:function`. Any callable that maps a prompt string to a
+completion string works — sync or async, provider-agnostic:
+
+```python
+from anthropic import Anthropic
+_client = Anthropic()
+
+def claude_model(prompt: str) -> str:
+    msg = _client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=512,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return msg.content[0].text
+```
+
+---
+
+## Assertions
+
+| type | scores | notes |
+|---|---|---|
+| `equals` | 0 or 1 | normalises whitespace and case |
+| `contains` | proportional | 3 of 4 required strings scores 0.75, not 0 |
+| `regex` | 0 or 1 | supports negative lookahead for "must not contain" |
+| `valid_json` | graded | tolerates ` ```json ` fences; validity worth 0.5, required keys the rest |
+| `json_field` | 0 or 1 | the workhorse for classification and extraction |
+| `token_overlap` | F1 | dependency-free stand-in for embedding similarity |
+| `max_length` | exponential decay | a 10% overrun is not treated like a 500% one |
+| `refuses` | 0 or 1 | for safety cases where compliance is the failure |
+| `llm_judge` | graded | for genuinely unmechanical criteria — used sparingly, see below |
+
+A case scores the **minimum** across its assertions, not the mean. A passing format
+check must never paper over a wrong answer.
+
+`llm_judge` is deliberately last and deliberately awkward to reach for: it is the
+slowest, priciest, and least reproducible option, and a judge model that drifts
+silently rewrites your baseline.
+
+---
+
+## Statistics
+
+`stats.py` is pure standard library on purpose.
+
+- **`bootstrap_paired`** — resamples per-case differences 10,000 times, no normality
+  assumption. Eval scores are bounded, skewed and spiky at 0 and 1, which is exactly
+  where a t-test is weakest. Seeded, so identical inputs always produce an identical
+  verdict; a gate that flips on the same data gets disabled.
+- **`wilson_interval`** — pass-rate confidence bounds that stay inside [0,1]. The
+  textbook normal approximation produces upper bounds above 100% on small suites at
+  high pass rates, which is precisely the regime eval suites live in.
+- **`required_sample_size`** — how many cases you need to detect a drop of a given size.
+  Worth running before trusting any gate: teams routinely try to catch a 0.02 regression
+  with 30 cases, which is underpowered by about an order of magnitude, then conclude
+  evals don't work.
+
+Comparison is **paired** — the same cases under both prompts — which removes case
+difficulty as a variance source and is far more sensitive on the 50–300 case suites
+teams actually maintain.
+
+---
+
+## Example suite
+
+`examples/customs_classification/` triages inbound customs and regulatory messages into
+an operational disposition. It covers the categories that matter in a regulated
+workflow: correct disposition, incomplete data, duplicate-message idempotency,
+hallucinated reason codes, PII echo, and refusing to fabricate a clearance status.
+
+Data is synthetic and modelled on publicly documented customs workflows. Two
+deterministic stand-in models are included so the whole thing runs with no API key and
+no network — `baseline_model` behaves, `regressed_model` has two deliberate defects so
+you can watch the gate catch them.
+
+---
+
+## CI
+
+`.github/workflows/eval.yml` runs the unit tests, then the suite, then the gate — and
+posts the result to the PR summary. A regression fails the check the same way a broken
+build does.
+
+---
+
+## License
+
+MIT
