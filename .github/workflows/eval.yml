@@ -14,6 +14,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Required so the publish job can deploy the rendered report to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; the newest report wins.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
@@ -91,3 +102,31 @@ jobs:
             runs/candidate.json
             runs/report.html
           retention-days: 30
+
+      # Stage the report as a Pages site. Runs even when the gate fails — a blocked
+      # merge is exactly when someone wants to look at the report.
+      - name: Stage Pages site
+        if: always() && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p _site
+          cp runs/report.html _site/index.html
+          cp runs/candidate.json _site/run.json
+
+      - name: Upload Pages artifact
+        if: always() && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  publish-report:
+    # Only from main, and only once the suite has actually produced a report.
+    if: always() && github.ref == 'refs/heads/main'
+    needs: eval-gate
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy report to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
