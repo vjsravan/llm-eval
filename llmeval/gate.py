@@ -17,6 +17,7 @@ everything absolutely (and drown in false alarms until the gate is removed).
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass, field
 
 from .runner import Run
@@ -61,21 +62,24 @@ class GatePolicy:
         failures: list[str] = []
         warnings: list[str] = []
 
-        # ── Absolute floors, evaluated per tag ──
-        by_tag = run.by_tag()
+        # ── Absolute floors, evaluated per case ──
+        # Per case, not per-tag mean. Averaging is how a safety failure gets laundered:
+        # cases scoring 1.0 and 0.6 average to 0.8 and clear a 0.8 floor, even though
+        # one of them is exactly the failure the floor exists to stop.
         for tag, floor in sorted(self.tag_floors.items()):
-            actual = by_tag.get(tag)
-            if actual is None:
+            tagged = [r for r in run.results if tag in r.tags]
+            if not tagged:
                 warnings.append(f"policy names tag {tag!r} but no case carries it")
                 continue
-            if actual < floor:
-                offenders = [
-                    r.case_id for r in run.results if tag in r.tags and r.score < floor
-                ]
-                shown = ", ".join(offenders[:4])
+            offenders = [r for r in tagged if r.score < floor]
+            if offenders:
+                shown = ", ".join(r.case_id for r in offenders[:4])
                 more = f" (+{len(offenders) - 4})" if len(offenders) > 4 else ""
+                worst = min(r.score for r in offenders)
+                mean = statistics.fmean([r.score for r in tagged])
                 failures.append(
-                    f"tag {tag!r} scored {actual:.3f}, floor is {floor:.3f} — {shown}{more}"
+                    f"tag {tag!r}: {len(offenders)} of {len(tagged)} cases below floor "
+                    f"{floor:.3f} (worst {worst:.3f}, mean {mean:.3f}) — {shown}{more}"
                 )
 
         if self.min_mean_score is not None and run.mean_score < self.min_mean_score:
@@ -98,13 +102,28 @@ class GatePolicy:
                 # The drop looks bad but the suite cannot support the claim. Say so, and
                 # say how many cases it would take — otherwise the reader assumes "not
                 # significant" means "fine".
-                sd = max(0.05, abs(comparison.delta))
-                needed = required_sample_size(effect=abs(comparison.delta), sd=sd)
-                warnings.append(
-                    f"mean fell {comparison.delta:+.3f} but the interval includes zero; "
-                    f"~{needed} paired cases would be needed to call a drop this size "
-                    f"(suite has {comparison.n})"
-                )
+                #
+                # The sample-size estimate uses the observed spread of the paired
+                # differences. Substituting a guess (e.g. sd = |delta|) makes effect/sd
+                # equal 1 and reports ~8 cases for any effect whatsoever — a number that
+                # contradicts the very verdict it is explaining when the suite is bigger
+                # than 8.
+                sd = comparison.sd_diff
+                if sd > 0:
+                    needed = required_sample_size(effect=abs(comparison.delta), sd=sd)
+                    warnings.append(
+                        f"mean fell {comparison.delta:+.3f} but the interval includes zero; "
+                        f"~{needed} paired cases would be needed to call a drop this size "
+                        f"at sd={sd:.3f} (suite has {comparison.n})"
+                    )
+                else:
+                    # Zero spread with a non-zero mean cannot happen for a real paired
+                    # set; it means the comparison predates sd_diff or n < 2.
+                    warnings.append(
+                        f"mean fell {comparison.delta:+.3f} but the interval includes zero; "
+                        f"per-case spread unavailable, so the suite size needed to call "
+                        f"a drop this size cannot be estimated (suite has {comparison.n})"
+                    )
 
         return GateResult(passed=not failures, failures=tuple(failures), warnings=tuple(warnings))
 

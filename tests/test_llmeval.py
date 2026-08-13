@@ -36,6 +36,11 @@ from llmeval.runner import Run
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "customs_classification" / "suite.json"
 
 
+def always_good(rubric: str, output: str) -> float:
+    """Stand-in judge, referenced by import path in the llm_judge loader test."""
+    return 1.0
+
+
 class TestAssertions(unittest.TestCase):
     def test_equals_normalises_whitespace_and_case(self):
         self.assertEqual(Equals("Hold Shipment").score("  hold   SHIPMENT ", None).value, 1.0)
@@ -140,6 +145,40 @@ class TestDataset(unittest.TestCase):
         self.assertTrue(len(safety) >= 2)
         self.assertTrue(all("safety" in c.tags for c in safety))
 
+    def _load_payload(self, payload: dict):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(payload, fh)
+            path = fh.name
+        return load_suite(path)
+
+    def test_llm_judge_is_loadable_from_a_suite_file(self):
+        """Documented in the README and exported from the package, so it has to be
+        reachable from a suite — not just from Python."""
+        suite = self._load_payload({"name": "judged", "cases": [
+            {"id": "j", "input": "a", "assertions": [
+                {"type": "llm_judge", "rubric": "is it polite?",
+                 "judge_fn": "tests.test_llmeval:always_good"},
+            ]},
+        ]})
+        self.assertEqual(len(suite), 1)
+        self.assertEqual(suite.cases[0].assertions[0].score("anything", None).value, 1.0)
+
+    def test_llm_judge_with_a_bad_judge_path_fails_at_load(self):
+        """Better to fail before the run than after paying for every completion."""
+        with self.assertRaises(ValueError):
+            self._load_payload({"name": "judged", "cases": [
+                {"id": "j", "input": "a", "assertions": [
+                    {"type": "llm_judge", "rubric": "r", "judge_fn": "tests.test_llmeval:nope"},
+                ]},
+            ]})
+
+    def test_every_documented_assertion_type_is_loadable(self):
+        from llmeval.dataset import _ASSERTION_TYPES
+        documented = {"equals", "contains", "regex", "valid_json", "json_field",
+                      "token_overlap", "max_length", "refuses", "llm_judge"}
+        self.assertEqual(documented - set(_ASSERTION_TYPES), set())
+
 
 class TestRunner(unittest.TestCase):
     def setUp(self):
@@ -218,6 +257,111 @@ class TestRunner(unittest.TestCase):
         self.assertAlmostEqual(run.by_tag()["x"], 0.5)
         self.assertAlmostEqual(run.by_tag()["y"], 1.0)
 
+    def test_repeated_assertion_types_are_all_graded(self):
+        """Two assertions of the same type must not collide in the results dict.
+
+        Assertion.name is the type ("json_field"), so keying results by it alone drops
+        every occurrence but the last — the case is then graded on a subset of its own
+        assertions and a wrong answer can score a perfect 1.0.
+        """
+        suite = Suite("t", [GoldenCase("c", "in", [
+            ValidJson(),
+            JsonFieldEquals("disposition", "hold"),   # violated below
+            JsonFieldEquals("blocking", True),        # satisfied below
+        ])])
+        run = run_suite(suite, lambda p: '{"disposition": "WRONG", "blocking": true}')
+        result = run.results[0]
+
+        self.assertEqual(len(result.assertion_scores), 3, "every assertion must be recorded")
+        self.assertEqual(result.assertion_scores["json_field"], 0.0)
+        self.assertEqual(result.assertion_scores["json_field#2"], 1.0)
+        self.assertEqual(result.score, 0.0, "a wrong field must sink the case")
+
+    def test_repeated_assertions_keep_their_own_reasons(self):
+        suite = Suite("t", [GoldenCase("c", "in", [
+            Contains(required=("alpha",)),
+            Contains(required=("zulu",)),
+        ])])
+        run = run_suite(suite, lambda p: "alpha only")
+        reasons = run.results[0].reasons
+        self.assertEqual(reasons["contains"], "all present")
+        self.assertIn("zulu", reasons["contains#2"])
+        self.assertEqual(run.results[0].assertion_scores["contains"], 1.0)
+        self.assertEqual(run.results[0].assertion_scores["contains#2"], 0.0)
+
+    def test_blocking_model_runs_concurrently(self):
+        """A sync client must be driven off the event loop.
+
+        Calling model(prompt) on the loop and only then handing the finished value to a
+        thread blocks first, which silently serialises the suite and makes --concurrency
+        a no-op for every blocking provider SDK.
+        """
+        import time
+
+        delay = 0.2
+        suite = Suite("t", [GoldenCase(f"c{i}", "in", [Equals("yes")]) for i in range(8)])
+
+        def slow(prompt: str) -> str:
+            time.sleep(delay)
+            return "yes"
+
+        started = time.perf_counter()
+        run = run_suite(suite, slow, concurrency=8, retries=0)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(run.error_count, 0)
+        self.assertLess(elapsed, 8 * delay * 0.5,
+                        f"8 cases at concurrency=8 took {elapsed:.2f}s — they ran serially")
+
+    def test_timeout_fires_against_a_blocking_model(self):
+        import time
+
+        suite = Suite("t", [GoldenCase("c", "in", [Equals("yes")])])
+        run = run_suite(suite, lambda p: (time.sleep(2.0), "yes")[1],
+                        retries=0, timeout_s=0.2, concurrency=1)
+        self.assertEqual(run.error_count, 1)
+        self.assertIn("timeout", run.results[0].error)
+
+    def test_async_model_is_awaited(self):
+        import asyncio
+
+        async def model(prompt: str) -> str:
+            await asyncio.sleep(0)
+            return "yes"
+
+        run = run_suite(Suite("t", [GoldenCase("c", "in", [Equals("yes")])]), model)
+        self.assertEqual(run.results[0].score, 1.0)
+
+    def test_callable_returning_a_coroutine_is_awaited(self):
+        """functools.partial over an async fn is not a coroutine *function*, but its
+        return value is still awaitable and must not be scored as a string."""
+        import asyncio
+        import functools
+
+        async def model(tag: str, prompt: str) -> str:
+            await asyncio.sleep(0)
+            return "yes"
+
+        run = run_suite(Suite("t", [GoldenCase("c", "in", [Equals("yes")])]),
+                        functools.partial(model, "tag"))
+        self.assertEqual(run.results[0].score, 1.0)
+
+    def test_latency_excludes_retry_backoff(self):
+        """latency_ms describes the successful call, not the retry loop around it —
+        otherwise backoff sleeps quietly poison p95_latency_ms."""
+        attempts = {"n": 0}
+
+        def recovers(prompt: str) -> str:
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise RuntimeError("transient")
+            return "yes"
+
+        run = run_suite(Suite("t", [GoldenCase("c", "in", [Equals("yes")])]), recovers, retries=3)
+        self.assertEqual(run.results[0].score, 1.0)
+        # Two failures mean ~0.25s + ~0.5s of backoff before the winning attempt.
+        self.assertLess(run.results[0].latency_ms, 200)
+
 
 class TestStats(unittest.TestCase):
     def test_bootstrap_is_deterministic(self):
@@ -267,6 +411,39 @@ class TestStats(unittest.TestCase):
     def test_required_sample_size_grows_as_effect_shrinks(self):
         self.assertGreater(required_sample_size(0.01, 0.2), required_sample_size(0.10, 0.2))
 
+    def test_comparison_carries_the_observed_spread(self):
+        """Power analysis needs the sd of the paired differences, and the gate has no
+        other way to recover it once the Comparison is built."""
+        import statistics
+
+        base = {f"c{i}": 1.0 for i in range(10)}
+        cand = {f"c{i}": (0.0 if i < 2 else 1.0) for i in range(10)}
+        cmp = compare_runs(base, cand)
+        expected = statistics.stdev([cand[k] - base[k] for k in base])
+        self.assertAlmostEqual(cmp.sd_diff, round(expected, 4), places=4)
+        self.assertGreater(cmp.sd_diff, abs(cmp.delta),
+                           "two total failures spread wider than the mean drop suggests")
+
+    def test_identical_runs_have_zero_spread(self):
+        scores = {f"c{i}": 0.8 for i in range(10)}
+        self.assertEqual(compare_runs(scores, dict(scores)).sd_diff, 0.0)
+
+    def test_p_value_is_small_when_the_drop_is_unambiguous(self):
+        base = {f"c{i}": 1.0 for i in range(60)}
+        cand = {f"c{i}": 0.5 for i in range(60)}
+        self.assertLess(compare_runs(base, cand).p_value, 0.01)
+
+    def test_p_value_is_one_when_nothing_moved(self):
+        scores = {f"c{i}": 0.8 for i in range(20)}
+        self.assertEqual(compare_runs(scores, dict(scores)).p_value, 1.0)
+
+    def test_p_value_is_symmetric_under_direction(self):
+        """The two-sided ASL must not depend on which run is called the baseline."""
+        base = {f"c{i}": (1.0 if i < 7 else 0.4) for i in range(20)}
+        cand = {f"c{i}": (0.4 if i < 7 else 1.0) for i in range(20)}
+        self.assertAlmostEqual(compare_runs(base, cand).p_value,
+                               compare_runs(cand, base).p_value, places=2)
+
 
 class TestGate(unittest.TestCase):
     def _run_with(self, score_map: dict[str, float], tags: dict[str, tuple[str, ...]]) -> Run:
@@ -306,6 +483,65 @@ class TestGate(unittest.TestCase):
     def test_min_mean_score_floor(self):
         run = self._run_with({"a": 1.0, "b": 0.0}, {})
         self.assertFalse(GatePolicy(min_mean_score=0.9).evaluate(run).passed)
+
+    def test_tag_floor_is_per_case_not_per_tag_mean(self):
+        """A passing sibling must not average away a failing safety case.
+
+        Scores of 1.0 and 0.6 have a mean of 0.8 and would clear a 0.8 floor, even
+        though the 0.6 case is exactly what the floor exists to block.
+        """
+        suite = Suite("t", [
+            GoldenCase("clean", "clean", [Equals("yes")], tags=("safety",)),
+            GoldenCase("partial", "partial", [Contains(required=("a", "b", "c", "d", "e"))],
+                       tags=("safety",)),
+        ])
+        # 1.0 and 0.6 (3 of 5 required strings) → mean lands exactly on 0.8.
+        run = run_suite(suite, lambda p: "yes" if p == "clean" else "a b c")
+        by_tag = run.by_tag()
+        self.assertAlmostEqual(by_tag["safety"], 0.8, msg="fixture must sit exactly on the floor")
+
+        result = GatePolicy(tag_floors={"safety": 0.8}).evaluate(run)
+        self.assertFalse(result.passed, "a case below the floor must block, mean notwithstanding")
+        self.assertIn("partial", result.failures[0])
+        self.assertNotIn("clean", result.failures[0])
+
+    def test_tag_floor_failure_counts_offenders(self):
+        run = self._run_with({"a": 0.0, "b": 0.0, "c": 1.0},
+                             {"a": ("safety",), "b": ("safety",), "c": ("safety",)})
+        failure = GatePolicy(tag_floors={"safety": 1.0}).evaluate(run).failures[0]
+        self.assertIn("2 of 3", failure)
+
+    def test_power_warning_uses_the_observed_spread(self):
+        """The 'cases needed' figure must come from the real sd of the paired diffs.
+
+        Guessing sd = |delta| makes effect/sd equal 1 and reports ~8 cases for any
+        effect at all — which contradicts the inconclusive verdict it is explaining
+        whenever the suite is larger than 8.
+        """
+        base = {f"c{i}": 1.0 for i in range(10)}
+        cand = {f"c{i}": (0.0 if i < 2 else 1.0) for i in range(10)}
+        cmp = compare_runs(base, cand)
+        self.assertFalse(cmp.significant, "10 cases cannot support a claim about this drop")
+
+        run = self._run_with({f"c{i}": 1.0 for i in range(10)}, {})
+        warning = GatePolicy().evaluate(run, cmp).warnings[0]
+
+        needed = required_sample_size(effect=abs(cmp.delta), sd=cmp.sd_diff)
+        self.assertIn(f"~{needed} paired cases", warning)
+        self.assertGreater(needed, cmp.n,
+                           "an underpowered suite must be told it needs MORE cases than it has")
+
+    def test_gate_survives_a_comparison_without_spread(self):
+        """Runs saved before sd_diff existed deserialise with sd_diff=0.0; the gate must
+        warn honestly rather than divide by it."""
+        from llmeval.stats import Comparison
+
+        cmp = Comparison(n=10, baseline_mean=0.95, candidate_mean=0.75, delta=-0.2,
+                         ci_low=-0.5, ci_high=0.0, p_value=0.2,
+                         regressed_cases=(), improved_cases=())
+        run = self._run_with({"a": 1.0}, {})
+        result = GatePolicy().evaluate(run, cmp)
+        self.assertTrue(any("cannot be estimated" in w for w in result.warnings))
 
 
 class TestReports(unittest.TestCase):

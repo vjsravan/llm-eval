@@ -38,6 +38,10 @@ class Comparison:
     p_value: float
     regressed_cases: tuple[str, ...]
     improved_cases: tuple[str, ...]
+    # Standard deviation of the per-case differences. Carried on the result because
+    # power analysis needs it and the gate has no other way to recover it — guessing
+    # a value there produces a confidently wrong "cases needed" number.
+    sd_diff: float = 0.0
 
     @property
     def significant(self) -> bool:
@@ -95,15 +99,15 @@ def bootstrap_paired(
     lo = means[max(0, int(tail * iterations) - 1)]
     hi = means[min(iterations - 1, int((1.0 - tail) * iterations))]
 
-    # Two-sided achieved significance level: how often the resampled mean crosses zero.
+    # Two-sided achieved significance level: how often the resampled mean lands on the
+    # far side of zero from the observed effect.
     observed = sum(diffs) / n
     if observed == 0:
         p = 1.0
+    elif observed > 0:
+        p = min(1.0, 2.0 * sum(1 for m in means if m <= 0) / iterations)
     else:
-        crossings = sum(1 for m in means if (m <= 0) if observed > 0) or sum(
-            1 for m in means if (m >= 0) if observed < 0
-        )
-        p = min(1.0, 2.0 * crossings / iterations)
+        p = min(1.0, 2.0 * sum(1 for m in means if m >= 0) / iterations)
 
     return lo, hi, p
 
@@ -134,6 +138,8 @@ def compare_runs(
 
     base_mean = statistics.fmean(base)
     cand_mean = statistics.fmean(cand)
+    diffs = [c - b for b, c in zip(base, cand)]
+    sd_diff = statistics.stdev(diffs) if len(diffs) > 1 else 0.0
 
     return Comparison(
         n=len(shared),
@@ -145,6 +151,7 @@ def compare_runs(
         p_value=round(p, 4),
         regressed_cases=regressed,
         improved_cases=improved,
+        sd_diff=round(sd_diff, 4),
     )
 
 

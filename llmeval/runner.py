@@ -13,6 +13,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import statistics
 import time
@@ -117,12 +118,50 @@ class Run:
         return cls(**raw)
 
 
+def _is_async_callable(model: ModelFn) -> bool:
+    if inspect.iscoroutinefunction(model):
+        return True
+    call = getattr(model, "__call__", None)
+    return call is not None and inspect.iscoroutinefunction(call)
+
+
 async def _invoke(model: ModelFn, prompt: str) -> str:
-    result = model(prompt)
-    if asyncio.iscoroutine(result):
+    if _is_async_callable(model):
+        return await model(prompt)  # type: ignore[misc]
+
+    # Blocking client: the *call itself* has to happen off the loop. Invoking
+    # model(prompt) here and handing the finished result to a thread would block the
+    # loop first, which serialises the whole suite (concurrency becomes a no-op) and
+    # leaves wait_for with nothing to interrupt.
+    #
+    # A cancelled wait_for cannot kill the worker thread — Python has no way to do
+    # that. The case is still recorded as a timeout at the deadline and the loop stays
+    # free, so the rest of the suite keeps moving; the one residue is that run_suite
+    # waits for abandoned threads to drain before returning. Pass a timeout to the
+    # provider client itself if that matters.
+    result = await asyncio.to_thread(model, prompt)
+
+    # Covers callables that are not coroutine functions but still return awaitables:
+    # functools.partial over an async fn, a lambda wrapping one, a decorated client.
+    if inspect.isawaitable(result):
         return await result
-    # Blocking client: hand it to the default executor rather than blocking the loop.
-    return await asyncio.to_thread(lambda: result)  # type: ignore[return-value]
+    return result  # type: ignore[return-value]
+
+
+def _unique_key(taken: dict[str, Score], name: str) -> str:
+    """Assertion.name is the assertion *type* ("json_field"), not a per-instance id, so
+    a case carrying two field checks would collide in the results dict and silently drop
+    the first one — the case would then be graded on a subset of its own assertions.
+
+    First occurrence keeps the bare name so reports and saved runs stay readable;
+    subsequent ones get "#2", "#3".
+    """
+    if name not in taken:
+        return name
+    n = 2
+    while f"{name}#{n}" in taken:
+        n += 1
+    return f"{name}#{n}"
 
 
 async def _run_case(
@@ -133,9 +172,13 @@ async def _run_case(
     timeout_s: float,
 ) -> CaseResult:
     last_error: str | None = None
-    started = time.perf_counter()
+    first_started = time.perf_counter()
 
     for attempt in range(retries + 1):
+        # Timed per attempt, not across the retry loop: latency_ms should describe how
+        # long the provider took to answer, not how long backoff sleeps took. Rolling
+        # retries into it would quietly poison p95_latency_ms.
+        started = time.perf_counter()
         try:
             output = await asyncio.wait_for(_invoke(model, case.input), timeout=timeout_s)
             elapsed = (time.perf_counter() - started) * 1000
@@ -144,9 +187,10 @@ async def _run_case(
             for assertion in case.assertions:
                 # A bad assertion must not sink the whole run; record it as a zero.
                 try:
-                    scores[assertion.name] = assertion.score(output, case)
+                    result = assertion.score(output, case)
                 except Exception as exc:  # noqa: BLE001
-                    scores[assertion.name] = Score(0.0, f"assertion raised {type(exc).__name__}: {exc}")
+                    result = Score(0.0, f"assertion raised {type(exc).__name__}: {exc}")
+                scores[_unique_key(scores, assertion.name)] = result
 
             # All assertions on a case must hold, so the case score is the weakest link.
             # Averaging here would let a passing format check paper over a wrong answer.
@@ -176,7 +220,8 @@ async def _run_case(
         score=0.0,
         assertion_scores={},
         reasons={},
-        latency_ms=round((time.perf_counter() - started) * 1000, 2),
+        # Nothing succeeded, so the only meaningful number is total time spent trying.
+        latency_ms=round((time.perf_counter() - first_started) * 1000, 2),
         tags=case.tags,
         weight=case.weight,
         error=last_error,
