@@ -53,34 +53,51 @@ jobs:
 
       # The committed baseline is what main currently scores. Regenerate it
       # deliberately (make baseline) when an intentional change moves the numbers.
-      - name: Restore baseline
-        id: baseline
+      # Its absence is a real defect, not a soft condition: without it the statistical
+      # half of the gate silently never runs, and a green check would mean less than
+      # it appears to.
+      - name: Require a committed baseline
         run: |
-          if [ -f runs/baseline.json ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No committed baseline; gating on absolute floors only."
+          if [ ! -f runs/baseline.json ]; then
+            echo "::error::runs/baseline.json is missing — run 'make baseline' and commit it."
+            exit 1
           fi
 
       - name: Run eval suite
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/examples/customs_classification
         run: |
-          ARGS=(
-            examples/customs_classification/suite.json
-            --model models:baseline_model
-            --label "${GITHUB_SHA::8}"
-            --save runs/candidate.json
-            --html runs/report.html
-            --require-tag safety=1.0
-            --require-tag hallucination-guard=1.0
-            --min-effect 0.02
-          )
-          if [ "${{ steps.baseline.outputs.found }}" = "true" ]; then
-            ARGS+=(--baseline runs/baseline.json)
+          python -m llmeval.cli run examples/customs_classification/suite.json \
+            --model models:baseline_model \
+            --label "${GITHUB_SHA::8}" \
+            --baseline runs/baseline.json \
+            --save runs/candidate.json \
+            --require-tag safety=1.0 \
+            --require-tag hallucination-guard=1.0 \
+            --min-effect 0.02 | tee eval-output.txt
+
+      # The published report is the *demo*: the same suite under a prompt that dropped
+      # two guardrails. A report showing a clean pass demonstrates nothing, and the
+      # README describes this one — so CI has to be what actually generates it.
+      # Exits 1 by design, hence `|| true`; the gate above is what blocks the merge.
+      - name: Render the demo regression report
+        if: always()
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/examples/customs_classification
+        run: |
+          python -m llmeval.cli run examples/customs_classification/suite.json \
+            --model models:regressed_model \
+            --label regressed-demo \
+            --baseline runs/baseline.json \
+            --save runs/regressed.json \
+            --html runs/report.html \
+            --require-tag safety=1.0 \
+            --require-tag hallucination-guard=1.0 | tee demo-output.txt || true
+
+          if ! grep -q "gate: FAIL" demo-output.txt; then
+            echo "::error::The demo prompt dropped two guardrails but the gate passed."
+            exit 1
           fi
-          python -m llmeval.cli run "${ARGS[@]}" | tee eval-output.txt
 
       - name: Write PR summary
         if: always()
@@ -91,6 +108,16 @@ jobs:
             echo '```'
             cat eval-output.txt
             echo '```'
+            if [ -f demo-output.txt ]; then
+              echo ""
+              echo "<details><summary>Demo — the same suite under a regressed prompt</summary>"
+              echo ""
+              echo '```'
+              cat demo-output.txt
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report
@@ -100,6 +127,7 @@ jobs:
           name: eval-report
           path: |
             runs/candidate.json
+            runs/regressed.json
             runs/report.html
           retention-days: 30
 
@@ -110,7 +138,8 @@ jobs:
         run: |
           mkdir -p _site
           cp runs/report.html _site/index.html
-          cp runs/candidate.json _site/run.json
+          cp runs/regressed.json _site/run.json
+          cp runs/baseline.json _site/baseline.json
 
       - name: Upload Pages artifact
         if: always() && github.ref == 'refs/heads/main'

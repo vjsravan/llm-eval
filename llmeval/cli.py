@@ -1,9 +1,9 @@
 """
 Command line entry point.
 
-    llmeval run     suite.json --model my.module:fn --label prompt-v4 --save runs/v4.json
-    llmeval compare runs/v3.json runs/v4.json --min-effect 0.02 --fail-on regression
-    llmeval report  runs/v4.json --baseline runs/v3.json --html report.html
+    llmeval run     suite.json --model my.module:fn --label prompt-v4 --save runs/candidate.json
+    llmeval compare runs/baseline.json runs/candidate.json --min-effect 0.02 --fail-on regression
+    llmeval report  runs/candidate.json --baseline runs/baseline.json --html report.html
 
 `compare` returns exit code 1 on a regression, which is what makes it usable as a CI
 gate — the workflow needs no scripting beyond calling this.
@@ -12,11 +12,10 @@ gate — the workflow needs no scripting beyond calling this.
 from __future__ import annotations
 
 import argparse
-import importlib
 import sys
 from pathlib import Path
 
-from .dataset import load_suite
+from .dataset import load_suite, resolve_callable
 from .gate import DEFAULT_POLICY, GatePolicy
 from .report import markdown_report, terminal_report, write_html
 from .runner import Run, run_suite
@@ -25,18 +24,10 @@ from .stats import compare_runs
 
 def _load_model_fn(spec: str):
     """Resolve 'package.module:callable' to the callable itself."""
-    if ":" not in spec:
-        raise SystemExit(f"--model must look like 'module:function', got {spec!r}")
-    module_name, fn_name = spec.rsplit(":", 1)
-    sys.path.insert(0, str(Path.cwd()))
     try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
-        raise SystemExit(f"could not import {module_name!r}: {exc}") from exc
-    fn = getattr(module, fn_name, None)
-    if fn is None or not callable(fn):
-        raise SystemExit(f"{module_name!r} has no callable named {fn_name!r}")
-    return fn
+        return resolve_callable(spec)
+    except ValueError as exc:
+        raise SystemExit(f"--model: {exc}") from exc
 
 
 def _build_policy(args: argparse.Namespace) -> GatePolicy:
@@ -109,8 +100,14 @@ def _cmd_compare(args: argparse.Namespace) -> int:
 
     if args.fail_on == "never":
         return 0
-    if args.fail_on == "any-change" and comparison.verdict(min_effect=args.min_effect) == "improvement":
-        print("  FAIL suite moved (--fail-on any-change)", file=sys.stderr)
+    # "any-change" means any statistically real movement, in either direction — the
+    # mode exists for suites that are supposed to be frozen, where an unexplained
+    # improvement is as much a signal that something shifted as a drop is.
+    if args.fail_on == "any-change" and comparison.significant:
+        print(
+            f"  FAIL suite moved {comparison.delta:+.3f} (--fail-on any-change)",
+            file=sys.stderr,
+        )
         return 1
     return 0 if result.passed else 1
 
@@ -155,7 +152,9 @@ def main(argv: list[str] | None = None) -> int:
     p_cmp.add_argument("candidate")
     p_cmp.add_argument("--min-effect", type=float, default=0.02,
                        help="deltas smaller than this are 'negligible' even if significant")
-    p_cmp.add_argument("--fail-on", choices=["regression", "any-change", "never"], default="regression")
+    p_cmp.add_argument("--fail-on", choices=["regression", "any-change", "never"], default="regression",
+                       help="'regression' blocks on the gate policy; 'any-change' also blocks on a "
+                            "significant improvement, for suites meant to be frozen; 'never' reports only")
     p_cmp.add_argument("--markdown", help="write a PR-ready markdown summary here")
     p_cmp.add_argument("--require-tag", action="append", metavar="TAG=SCORE",
                        help="absolute floor for a tag, e.g. safety=1.0 (repeatable)")

@@ -4,5 +4,10 @@ __pycache__/
 .venv/
 build/
 dist/
-runs/
 .DS_Store
+
+# Generated runs are disposable — except the baseline, which IS the gate's reference
+# point and has to be in the repo. Ignoring all of runs/ is why CI never had one to
+# compare against, so the statistical half of the gate silently never ran.
+runs/*
+!runs/baseline.json

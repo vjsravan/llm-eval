@@ -7,16 +7,19 @@ changes a prompt, the reviewer should be able to see which cases moved and by ho
 
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from .assertions import (
     Assertion,
     Contains,
     Equals,
     JsonFieldEquals,
+    LlmJudge,
     MatchesRegex,
     MaxLength,
     Refuses,
@@ -66,6 +69,27 @@ class Suite:
         return {t for c in self.cases for t in c.tags}
 
 
+def resolve_callable(spec: str) -> Callable:
+    """Resolve 'package.module:callable' to the callable itself.
+
+    Used for the pieces of a suite that cannot be expressed as data — currently just
+    an `llm_judge` grading function.
+    """
+    if not isinstance(spec, str) or ":" not in spec:
+        raise ValueError(f"expected 'module:function', got {spec!r}")
+    module_name, fn_name = spec.rsplit(":", 1)
+    if str(Path.cwd()) not in sys.path:
+        sys.path.insert(0, str(Path.cwd()))
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ValueError(f"could not import {module_name!r}: {exc}") from exc
+    fn = getattr(module, fn_name, None)
+    if fn is None or not callable(fn):
+        raise ValueError(f"{module_name!r} has no callable named {fn_name!r}")
+    return fn
+
+
 # Maps the on-disk assertion `type` to its constructor. Adding an assertion type means
 # adding it here; unknown types fail loudly at load time rather than silently scoring 0.
 _ASSERTION_TYPES = {
@@ -79,6 +103,12 @@ _ASSERTION_TYPES = {
     ),
     "max_length": lambda cfg: MaxLength(limit_chars=int(cfg["limit_chars"])),
     "refuses": lambda cfg: Refuses(),
+    # The grader is a callable, so a suite file names one by import path rather than
+    # inlining it. Resolved at load time so a bad path fails before the run starts
+    # instead of after you have paid for every completion.
+    "llm_judge": lambda cfg: LlmJudge(
+        rubric=cfg["rubric"], judge_fn=resolve_callable(cfg["judge_fn"])
+    ),
 }
 
 
